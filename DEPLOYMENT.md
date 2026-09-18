@@ -132,128 +132,50 @@ security group opens and that the `ServiceUrl` output (line 114) points at.
 
 ## 4. Scenario 2 diagnosis
 
-Deployed with `--parameters file://infra/params-scenario2.json`. Outputs (also in
-section 1): `InstanceId` = `i-017d5739cfc721eee`,
-`ServiceUrl` = `http://ec2-52-90-222-246.compute-1.amazonaws.com:8080`.
+Deployed with `infra/params-scenario2.json`: `InstanceId` = `i-017d5739cfc721eee`,
+`ServiceUrl` = `http://ec2-52-90-222-246.compute-1.amazonaws.com:8080` (section 1).
 
 **The failing curl** (command and output):
+
+Still failing 25 minutes after `CREATE_COMPLETE`, so not warm-up:
 
 ```
 $ curl http://ec2-52-90-222-246.compute-1.amazonaws.com:8080/api/health
 curl: (7) Failed to connect to ec2-52-90-222-246.compute-1.amazonaws.com port 8080 after 2216 ms: Could not connect to server
 ```
 
-This is a real failure, not warm-up: the same curl failed identically at 1 minute,
-2 minutes, and ~25 minutes after `CREATE_COMPLETE`:
-
-```
---- 1 min ---   curl: (7) Failed to connect to ec2-52-90-222-246.compute-1.amazonaws.com port 8080 after 2216 ms: Could not connect to server
---- 2 min ---   curl: (7) Failed to connect to ec2-52-90-222-246.compute-1.amazonaws.com port 8080 after 2207 ms: Could not connect to server
---- 25 min ---  curl: (7) Failed to connect to ec2-52-90-222-246.compute-1.amazonaws.com port 8080 after 2176 ms: Could not connect to server
-```
-
 **The log line that told you what was wrong:**
 
+On the instance via SSM (commands sent with `aws ssm send-command`, since I had no
+interactive terminal):
+
 ```
+sh-5.2$ sudo docker ps
+6d1db2491910   ghcr.io/cmu-17-214/lab04-service:latest   ...   Up 23 minutes   0.0.0.0:8080->8080/tcp, :::8080->8080/tcp   lab04-service
 sh-5.2$ sudo docker logs lab04-service
 lab04-service listening on 9090
 ```
 
-Side by side with `docker ps` on the same instance, which says the container is up
-and host port 8080 is mapped to **container port 8080**:
-
-```
-sh-5.2$ sudo docker ps
-CONTAINER ID   IMAGE                                     COMMAND                  CREATED          STATUS          PORTS                                       NAMES
-6d1db2491910   ghcr.io/cmu-17-214/lab04-service:latest   "/__cacert_entrypoin…"   23 minutes ago   Up 23 minutes   0.0.0.0:8080->8080/tcp, :::8080->8080/tcp   lab04-service
-```
-
-`docker ps` says 8080. `docker logs` says 9090. That contradiction is the diagnosis.
-
-Supporting evidence from the same shell, confirming it end to end:
-
-```
-sh-5.2$ sudo docker exec lab04-service env | grep PORT
-PORT=9090
-
-sh-5.2$ sudo ss -ltnp | grep -E ':8080|:9090'
-LISTEN 0      4096         0.0.0.0:8080       0.0.0.0:*    users:(("docker-proxy",pid=19197,fd=5))
-LISTEN 0      4096            [::]:8080          [::]:*    users:(("docker-proxy",pid=19252,fd=5))
-
-sh-5.2$ sudo grep -E 'EFFECTIVE_PORT=|docker run' /var/log/cloud-init-output.log
-+ EFFECTIVE_PORT=9090
-+ docker run -d --name lab04-service --restart unless-stopped -p 8080:8080 -e PORT=9090 ghcr.io/cmu-17-214/lab04-service:latest
-```
-
-(Shell was opened on the instance through Systems Manager against
-`i-017d5739cfc721eee`. The transcript above was captured by sending the same commands
-through SSM Run Command, `aws ssm send-command --document-name AWS-RunShellScript`,
-because I was driving it from a tool with no interactive terminal; `aws ssm
-start-session --target i-017d5739cfc721eee` is the interactive equivalent.)
-
 **What was wrong, and the fix you applied:**
 
-*Which port:* the service was listening on **9090** inside the container, while
-everything outside the container was wired for **8080**.
-
-*Wrong where:* `infra/params-scenario2.json` sets `PortOverride` to `"9090"` (the only
-difference from `params-healthy.json`). In `infra/template.yaml` the UserData script
-copies that into `EFFECTIVE_PORT` (line 96) and passes it to the container as
-`-e PORT=9090` (line 107), which is the port the app binds. But the port mapping on
-line 106 is `-p ${ServicePort}:${ServicePort}`, which is still `8080:8080`, and the
-security group ingress (lines 48-49) and the `ServiceUrl` output (line 114) also still
-say 8080. Only the container's `PORT` moved; nothing else followed it.
-
-*How the evidence shows it:* `docker ps` shows host 8080 forwarding to container
-8080. `docker logs` shows the app listening on 9090. `env` inside the container shows
-`PORT=9090`. `ss` on the host shows only Docker's proxy on 8080, so the host accepts
-the connection and forwards it to container port 8080, where nothing is listening;
-the connection is reset, which curl reports as "Could not connect". The container
-shows "Up" because it is healthy; it is just listening on the wrong side of the port
-mapping. The `cloud-init-output.log` trace shows the exact `docker run` line that
-produced this state.
-
-*The fix:* the infrastructure one. I did not patch the running container. I deleted
-the broken stack and created it again with `infra/params-healthy.json`, where
-`PortOverride` is empty, so the script's fallback (lines 97-99) sets
-`EFFECTIVE_PORT` to `ServicePort` and the container gets `-e PORT=8080`, matching the
-mapping, the security group, and the URL.
+The app inside the container was listening on **9090**, but Docker was forwarding
+host 8080 to **container 8080**, where nothing listens, so every connection was
+reset. `params-scenario2.json` sets `PortOverride=9090`; `infra/template.yaml` passes
+that to the container as `-e PORT=9090` (line 107) but leaves the mapping at
+`-p 8080:8080` (line 106), the security group at 8080 (lines 48-49), and the URL at
+8080 (line 114). `docker ps` shows the 8080 mapping and `docker logs` shows the 9090
+listener, which is the mismatch. Fix: deleted the stack and recreated it with
+`infra/params-healthy.json` (empty `PortOverride`, so `PORT` falls back to 8080,
+lines 97-99). No changes to the running container.
 
 **The healthy curl after the fix:**
 
-The redeploy:
-
-```
-$ aws cloudformation delete-stack --stack-name lab04-service
-$ aws cloudformation wait stack-delete-complete --stack-name lab04-service
-$ aws cloudformation create-stack --stack-name lab04-service \
-    --template-body file://infra/template.yaml \
-    --parameters file://infra/params-healthy.json
-$ aws cloudformation wait stack-create-complete --stack-name lab04-service
-$ aws cloudformation describe-stacks --stack-name lab04-service \
-    --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output table
-+------------+---------------------------------------------------------+
-|  InstanceId|  i-04a4331e0d2d25852                                    |
-|  ServiceUrl|  http://ec2-184-73-21-51.compute-1.amazonaws.com:8080   |
-+------------+---------------------------------------------------------+
-```
-
-The curl, from my laptop, ~50 seconds after the new stack hit `CREATE_COMPLETE`:
+New stack: `InstanceId` = `i-04a4331e0d2d25852`,
+`ServiceUrl` = `http://ec2-184-73-21-51.compute-1.amazonaws.com:8080` (section 1).
 
 ```
 $ curl http://ec2-184-73-21-51.compute-1.amazonaws.com:8080/api/health
 {"status":"ok"}
-```
-
-And on the new instance, the two lines that disagreed before now agree:
-
-```
-sh-5.2$ sudo docker ps
-ghcr.io/cmu-17-214/lab04-service:latest  Up 24 seconds  0.0.0.0:8080->8080/tcp, :::8080->8080/tcp  lab04-service
-sh-5.2$ sudo docker logs lab04-service
-lab04-service listening on 8080
-sh-5.2$ sudo docker exec lab04-service env | grep PORT
-PORT=8080
 ```
 
 ## 5. Teardown proof
