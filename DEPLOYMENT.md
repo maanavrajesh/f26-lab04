@@ -225,5 +225,22 @@ terminated
 ### Final teardown (Milestone 3)
 
 ```
+$ aws cloudformation delete-stack --stack-name lab04-service
+$ aws cloudformation wait stack-delete-complete --stack-name lab04-service
+$ aws cloudformation describe-stacks --stack-name lab04-service
+An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id lab04-service does not exist
 
+$ aws ec2 describe-instances --instance-ids i-04a4331e0d2d25852     --query "Reservations[].Instances[].State.Name" --output text
+terminated
+
+$ aws ec2 describe-instances --filters "Name=tag:course,Values=17-214"     "Name=instance-state-name,Values=pending,running,stopping,stopped"     --query "Reservations[].Instances[].InstanceId" --output text
+(empty: no lab-tagged instance is left in any non-terminated state)
+
+$ aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE     --query "StackSummaries[].StackName" --output text
+c226398a5716717l16948537t1w293021197474
+(the only remaining stack is Vocareum's own Learner Lab management stack, not one of mine)
 ```
+
+All three instances created during this lab (`i-071125f4f21c147e9`, `i-017d5739cfc721eee`,
+`i-04a4331e0d2d25852`) are terminated and the `lab04-service` stack no longer exists.
+Then ended the lab session with **End Lab** in the Learner Lab.
